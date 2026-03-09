@@ -3,6 +3,7 @@ package cmd
 import (
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 
@@ -907,15 +908,8 @@ func (f *mockBoolFlag) Type() string {
 
 // Helper function to compare string slices
 func stringsEqual(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
+	// Use the standard library comparator to avoid manual index handling.
+	return slices.Equal(a, b)
 }
 
 func TestSetupColors(t *testing.T) {
