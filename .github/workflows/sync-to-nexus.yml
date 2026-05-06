@@ -10,11 +10,25 @@ on:
   push:
     tags:
       - 'v*-alauda-*'
+  # Debug-phase: lets us iterate on this workflow file inside a PR
+  # against master without first merging it. GitHub picks up the
+  # workflow content from the PR head branch for `pull_request` events,
+  # which is what makes "test the workflow before it lands on master"
+  # possible. Required because `workflow_dispatch` only registers
+  # workflows that already exist on the default branch — so until this
+  # file lands on master, PR is the only path to a real GA run. The
+  # `paths` filter scopes triggers to edits of this file specifically,
+  # so unrelated source-code commits in the PR do not re-spam runs.
+  pull_request:
+    branches: [master]
+    paths:
+      - '.github/workflows/sync-to-nexus.yml'
   # Debug-phase: lets the maintainer re-run the Pipeline against an
   # ALREADY-PUBLISHED tag from the GitHub Actions UI (Run workflow
   # button) without pushing a new tag. Pick the tag from the input
   # field; the default points at a known-good tag with full release
-  # assets so smoke runs are zero-config.
+  # assets so smoke runs are zero-config. Note: `workflow_dispatch`
+  # only becomes available once this file is on the default branch.
   workflow_dispatch:
     inputs:
       tag:
@@ -42,13 +56,17 @@ jobs:
           # github.run_id is globally unique; run_attempt disambiguates re-runs.
           PR_NAME: sync-${{ github.run_id }}-${{ github.run_attempt }}
           REPO: ${{ github.repository }}
-          # On `push` (tag) events, github.ref_name is the tag itself.
-          # On `workflow_dispatch`, github.ref_name is the branch the
-          # workflow file lives on (useless), so we read inputs.tag
-          # instead. The fallback chain `inputs.tag || ref_name` lets
-          # both triggers share the rest of the script unchanged.
-          TAG: ${{ github.event.inputs.tag || github.ref_name }}
-          RELEASE_URL: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ github.event.inputs.tag || github.ref_name }}
+          # Tag selection priority:
+          #   1. `workflow_dispatch.inputs.tag` (UI Run-workflow button).
+          #   2. `pull_request` event → `github.ref_name` is the PR's
+          #      head branch name (useless as a release tag), so fall
+          #      back to a known-good debug tag with full release assets.
+          #   3. `push:tags` → `github.ref_name` is the tag itself.
+          # GitHub Actions has no real ternary; the `&&`/`||`
+          # short-circuit chain emulates one — `(cond && X) || Y`
+          # yields X when cond is truthy and Y otherwise.
+          TAG: ${{ github.event.inputs.tag || (github.event_name == 'pull_request' && 'v4.47.2-alauda-19') || github.ref_name }}
+          RELEASE_URL: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ github.event.inputs.tag || (github.event_name == 'pull_request' && 'v4.47.2-alauda-19') || github.ref_name }}
         run: |
           set -euo pipefail
 
