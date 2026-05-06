@@ -1,0 +1,112 @@
+name: Sync Release To Nexus
+
+# Triggers a Hub-resolved Tekton PipelineRun on the in-cluster ARC runner
+# whenever an alauda-suffixed tag is pushed. The pipeline (defined in
+# ops/edge-devops-task, exposed via Hub catalog `extras`) waits for the
+# corresponding GitHub Release to be ready, then mirrors its assets to
+# the internal Nexus under both a versioned path and a `latest/` channel.
+
+on:
+  push:
+    tags:
+      - 'v*-alauda-*'
+  # Debug-phase: lets the maintainer re-run the Pipeline against an
+  # ALREADY-PUBLISHED tag from the GitHub Actions UI (Run workflow
+  # button) without pushing a new tag. Pick the tag from the input
+  # field; the default points at a known-good tag with full release
+  # assets so smoke runs are zero-config.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag to mirror (e.g. v4.47.2-alauda-19)'
+        required: true
+        default: 'v4.47.2-alauda-19'
+
+jobs:
+  trigger-sync:
+    # Base ARC runner image already bundles tkn / kubectl / curl / jq / yq;
+    # no `container:` override needed.
+    runs-on: alauda-devops-runner
+    steps:
+      - name: create PipelineRun (Hub-resolved) and follow logs
+        env:
+          TEKTON_NS: devops
+          # Debug mode: the Pipeline is `kubectl apply`-ed directly into
+          # ${TEKTON_NS} by the maintainer for end-to-end testing before
+          # the catalog PR lands. Once merged into Tekton Hub catalog
+          # `extras`, switch the `pipelineRef` block below back to the
+          # hub resolver form (catalog=extras / kind=pipeline /
+          # name=sync-github-release-to-nexus / version=0.1).
+          PIPELINE_NAME: sync-github-release-to-nexus
+          # Deterministic PipelineRun name avoids racy label lookup.
+          # github.run_id is globally unique; run_attempt disambiguates re-runs.
+          PR_NAME: sync-${{ github.run_id }}-${{ github.run_attempt }}
+          REPO: ${{ github.repository }}
+          # On `push` (tag) events, github.ref_name is the tag itself.
+          # On `workflow_dispatch`, github.ref_name is the branch the
+          # workflow file lives on (useless), so we read inputs.tag
+          # instead. The fallback chain `inputs.tag || ref_name` lets
+          # both triggers share the rest of the script unchanged.
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          RELEASE_URL: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          # Source-repo label uses dots instead of slashes to satisfy
+          # Kubernetes label value charset (no '/').
+          SOURCE_REPO_LABEL="${REPO//\//.}"
+
+          # Create PipelineRun with metadata.name (not generateName) so the
+          # PR name is known up front for `tkn pr logs -f` below.
+          # github-token workspace intentionally omitted: forks are public,
+          # pipeline declares it `optional: true` and falls back to anonymous.
+          cat <<EOF | kubectl create -f -
+          apiVersion: tekton.dev/v1
+          kind: PipelineRun
+          metadata:
+            name: ${PR_NAME}
+            namespace: ${TEKTON_NS}
+            labels:
+              alauda.io/source-repo: ${SOURCE_REPO_LABEL}
+              alauda.io/source-tag: ${TAG}
+              alauda.io/triggered-by: github-actions
+          spec:
+            # Debug-phase: reference the in-namespace Pipeline by name.
+            # Replace this block with the `resolver: hub` form once the
+            # Pipeline is merged into the catalog (see PIPELINE_NAME env
+            # comment above).
+            pipelineRef:
+              name: ${PIPELINE_NAME}
+            params:
+              - { name: repo,        value: ${REPO} }
+              - { name: tag,         value: ${TAG} }
+              - { name: release-url, value: ${RELEASE_URL} }
+            workspaces:
+              - name: nexus-auth
+                secret:
+                  secretName: build-nexus.kauto
+              # Shared scratch PVC across the 5 run-script tasks. emptyDir
+              # would be per-pod and cannot propagate downloaded assets +
+              # intermediate metadata across TaskRuns; volumeClaimTemplate
+              # makes Tekton create a PipelineRun-owned PVC reaped with
+              # the run. RWO is sufficient — the DAG is strictly linear.
+              - name: source
+                volumeClaimTemplate:
+                  spec:
+                    storageClassName: topolvm
+                    accessModes:
+                      - ReadWriteOnce
+                    resources:
+                      requests:
+                        storage: 1Gi
+          EOF
+
+          # Stream logs until the PipelineRun completes; then surface the
+          # PipelineRun's Succeeded condition as the step exit code so the
+          # GitHub Actions UI reflects the real pipeline outcome.
+          tkn -n "${TEKTON_NS}" pr logs -f "${PR_NAME}"
+
+          STATUS=$(kubectl -n "${TEKTON_NS}" get pipelinerun "${PR_NAME}" \
+            -o jsonpath='{.status.conditions[?(@.type=="Succeeded")].status}')
+          echo "PipelineRun ${PR_NAME} final Succeeded status: ${STATUS}"
+          [ "${STATUS}" = "True" ]
