@@ -1,0 +1,100 @@
+name: Sync Release To Nexus
+
+# Triggers a Tekton PipelineRun on the in-cluster ARC runner whenever an
+# alauda-suffixed tag is pushed. The pipeline waits for the corresponding
+# GitHub Release to be ready, then mirrors its assets to the internal
+# Nexus under both a versioned path and a `latest/` channel.
+
+on:
+  push:
+    tags:
+      - 'v*-alauda-*'
+
+jobs:
+  trigger-sync:
+    # Base ARC runner image already bundles tkn / kubectl / curl / jq / yq;
+    # no `container:` override needed.
+    runs-on: alauda-devops-runner
+    steps:
+      - name: create PipelineRun and follow logs
+        env:
+          TEKTON_NS: devops
+          # Pipeline source: catalog "extras" via Tekton Hub resolver.
+          # Bump PIPELINE_VERSION together with catalog releases.
+          PIPELINE_CATALOG: extras
+          PIPELINE_NAME: sync-github-release-to-nexus
+          PIPELINE_VERSION: "0.1"
+          # Component-aware PipelineRun name so the run is identifiable
+          # at a glance in `kubectl get pipelinerun` listings:
+          # `sync-<repo>-<run_id>-<run_attempt>`. `github.event.repository.name`
+          # is just the repo without the owner (e.g. `yq`, `yq-private`,
+          # `trivy`, `cosign`, `chains`). `run_id` is globally unique;
+          # `run_attempt` disambiguates retries of the same run.
+          PR_NAME: sync-${{ github.event.repository.name }}-${{ github.run_id }}-${{ github.run_attempt }}
+          REPO: ${{ github.repository }}
+          # On `push: tags:` events, github.ref_name is the tag itself.
+          TAG: ${{ github.ref_name }}
+          RELEASE_URL: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          # Source-repo label uses dots instead of slashes to satisfy
+          # Kubernetes label value charset (no '/').
+          SOURCE_REPO_LABEL="${REPO//\//.}"
+
+          # Create PipelineRun with metadata.name (not generateName) so the
+          # PR name is known up front for `tkn pr logs -f` below.
+          # github-token workspace intentionally omitted: forks are public,
+          # pipeline declares it `optional: true` and falls back to anonymous.
+          cat <<EOF | kubectl create -f -
+          apiVersion: tekton.dev/v1
+          kind: PipelineRun
+          metadata:
+            name: ${PR_NAME}
+            namespace: ${TEKTON_NS}
+            labels:
+              alauda.io/source-repo: ${SOURCE_REPO_LABEL}
+              alauda.io/source-tag: ${TAG}
+              alauda.io/triggered-by: github-actions
+          spec:
+            pipelineRef:
+              resolver: hub
+              params:
+                - { name: catalog, value: ${PIPELINE_CATALOG} }
+                - { name: type,    value: tekton }
+                - { name: kind,    value: pipeline }
+                - { name: name,    value: ${PIPELINE_NAME} }
+                - { name: version, value: "${PIPELINE_VERSION}" }
+            params:
+              - { name: repo,        value: ${REPO} }
+              - { name: tag,         value: ${TAG} }
+              - { name: release-url, value: ${RELEASE_URL} }
+            workspaces:
+              - name: nexus-auth
+                secret:
+                  secretName: build-nexus.kauto
+              # Shared scratch PVC across the 5 run-script tasks. emptyDir
+              # would be per-pod and cannot propagate downloaded assets +
+              # intermediate metadata across TaskRuns; volumeClaimTemplate
+              # makes Tekton create a PipelineRun-owned PVC reaped with
+              # the run. RWO is sufficient — the DAG is strictly linear.
+              - name: source
+                volumeClaimTemplate:
+                  spec:
+                    storageClassName: topolvm
+                    accessModes:
+                      - ReadWriteOnce
+                    resources:
+                      requests:
+                        storage: 1Gi
+          EOF
+
+          # Stream logs until the PipelineRun completes; then surface the
+          # PipelineRun's Succeeded condition as the step exit code so the
+          # GitHub Actions UI reflects the real pipeline outcome.
+          tkn -n "${TEKTON_NS}" pr logs -f "${PR_NAME}"
+
+          STATUS=$(kubectl -n "${TEKTON_NS}" get pipelinerun "${PR_NAME}" \
+            -o jsonpath='{.status.conditions[?(@.type=="Succeeded")].status}')
+          echo "PipelineRun ${PR_NAME} final Succeeded status: ${STATUS}"
+          [ "${STATUS}" = "True" ]
