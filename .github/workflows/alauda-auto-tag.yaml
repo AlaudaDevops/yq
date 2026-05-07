@@ -12,6 +12,12 @@ permissions:
 jobs:
   tag:
     runs-on: ubuntu-latest
+    outputs:
+      # Expose the freshly created tag so downstream jobs (release, sync)
+      # in the same workflow run can act on it without relying on the
+      # `push: tags:` event — that event is suppressed when the tag is
+      # pushed using the default GITHUB_TOKEN.
+      new_tag: ${{ steps.latest.outputs.new_tag }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -85,3 +91,94 @@ jobs:
     name: Release Alauda
     needs: [tag]
     uses: ./.github/workflows/reusable-release-alauda.yaml
+
+  sync-to-nexus:
+    # Inlined from the former sync-to-nexus.yml workflow. We can't rely on
+    # `on.push.tags` to chain workflows here because the tag above is pushed
+    # with the default GITHUB_TOKEN, which by design does not trigger new
+    # workflow runs. Running sync as a downstream job in the same workflow
+    # run sidesteps that limitation entirely.
+    name: Sync Release To Nexus
+    needs: [tag]
+    runs-on: alauda-devops-runner
+    steps:
+      - name: create PipelineRun and follow logs
+        env:
+          TEKTON_NS: devops
+          # Pipeline source: catalog "alauda" via Tekton Hub resolver.
+          # Bump PIPELINE_VERSION together with catalog releases.
+          PIPELINE_CATALOG: alauda
+          PIPELINE_NAME: sync-github-release-to-nexus
+          PIPELINE_VERSION: "0.1"
+          # Component-aware PipelineRun name so the run is identifiable
+          # at a glance in `kubectl get pipelinerun` listings.
+          PR_NAME: sync-${{ github.event.repository.name }}-${{ github.run_id }}-${{ github.run_attempt }}
+          REPO: ${{ github.repository }}
+          # The tag was just produced by the `tag` job; pull it from the
+          # job output rather than github.ref_name (which here is the
+          # source branch, not a tag).
+          TAG: ${{ needs.tag.outputs.new_tag }}
+          RELEASE_URL: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ needs.tag.outputs.new_tag }}
+        run: |
+          set -euo pipefail
+
+          # Source-repo label uses dots instead of slashes to satisfy
+          # Kubernetes label value charset (no '/').
+          SOURCE_REPO_LABEL="${REPO//\//.}"
+
+          # Create PipelineRun with metadata.name (not generateName) so the
+          # PR name is known up front for `tkn pr logs -f` below.
+          # github-token workspace intentionally omitted: forks are public,
+          # pipeline declares it `optional: true` and falls back to anonymous.
+          cat <<EOF | kubectl create -f -
+          apiVersion: tekton.dev/v1
+          kind: PipelineRun
+          metadata:
+            name: ${PR_NAME}
+            namespace: ${TEKTON_NS}
+            labels:
+              alauda.io/source-repo: ${SOURCE_REPO_LABEL}
+              alauda.io/source-tag: ${TAG}
+              alauda.io/triggered-by: github-actions
+          spec:
+            pipelineRef:
+              resolver: hub
+              params:
+                - { name: catalog, value: ${PIPELINE_CATALOG} }
+                - { name: type,    value: tekton }
+                - { name: kind,    value: pipeline }
+                - { name: name,    value: ${PIPELINE_NAME} }
+                - { name: version, value: "${PIPELINE_VERSION}" }
+            params:
+              - { name: repo,        value: ${REPO} }
+              - { name: tag,         value: ${TAG} }
+              - { name: release-url, value: ${RELEASE_URL} }
+            workspaces:
+              - name: nexus-auth
+                secret:
+                  secretName: build-nexus.kauto
+              # Shared scratch PVC across the 5 run-script tasks. emptyDir
+              # would be per-pod and cannot propagate downloaded assets +
+              # intermediate metadata across TaskRuns; volumeClaimTemplate
+              # makes Tekton create a PipelineRun-owned PVC reaped with
+              # the run. RWO is sufficient — the DAG is strictly linear.
+              - name: source
+                volumeClaimTemplate:
+                  spec:
+                    storageClassName: topolvm
+                    accessModes:
+                      - ReadWriteOnce
+                    resources:
+                      requests:
+                        storage: 1Gi
+          EOF
+
+          # Stream logs until the PipelineRun completes; then surface the
+          # PipelineRun's Succeeded condition as the step exit code so the
+          # GitHub Actions UI reflects the real pipeline outcome.
+          tkn -n "${TEKTON_NS}" pr logs -f "${PR_NAME}"
+
+          STATUS=$(kubectl -n "${TEKTON_NS}" get pipelinerun "${PR_NAME}" \
+            -o jsonpath='{.status.conditions[?(@.type=="Succeeded")].status}')
+          echo "PipelineRun ${PR_NAME} final Succeeded status: ${STATUS}"
+          [ "${STATUS}" = "True" ]
