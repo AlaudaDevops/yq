@@ -30,4 +30,4 @@ require (
 	golang.org/x/sys v0.43.0 // indirect
 )
 
-go 1.26.3
+go 1.26.4
