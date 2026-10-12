@@ -35,6 +35,11 @@ linters:
       - linters:
           - revive
         text: var-naming
+      # Added to revive's defaults after golangci-lint v2.11; the flagged
+      # constructors are long-standing public API.
+      - linters:
+          - revive
+        text: unexported-return
     paths:
       - third_party$
       - builtin$
